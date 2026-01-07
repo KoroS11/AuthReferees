@@ -1,0 +1,191 @@
+/* Cyberpunk-ish palette without going unreadable */
+
+Screen {
+  background: #000000;
+  color: #FFFFFF;
+}
+
+/* Boot + busy overlays */
+
+#boot {
+  height: 3;
+  content-align: center middle;
+  display: none;
+}
+
+#boot.show {
+  display: block;
+}
+
+#busy {
+  height: 1;
+  padding: 0 1;
+  content-align: left middle;
+  display: none;
+}
+
+#busy.show {
+  display: block;
+}
+
+Screen.matrix {
+  background: #000000;
+  color: #00FF00;
+}
+
+Screen.dracula {
+  background: #282A36;
+  color: #F8F8F2;
+}
+
+#top {
+  height: 2;
+  padding: 0 1;
+}
+
+#scan {
+  height: 1;
+  padding: 0 1;
+}
+
+#main {
+  height: 1fr;
+}
+
+#left {
+  width: 34%;
+  padding: 1 1;
+  border: double #00D9FF;
+}
+
+#left:focus-within {
+  border: double #BD00FF;
+}
+
+#center {
+  width: 38%;
+  padding: 1 1;
+  border: double #00D9FF;
+}
+
+#center:focus-within {
+  border: double #BD00FF;
+}
+
+#trace_scroll {
+  height: 1fr;
+  min-height: 8;
+}
+
+#right_wrap {
+  width: 28%;
+  padding: 1 1;
+  border: double #00D9FF;
+}
+
+#right_wrap:focus-within {
+  border: double #BD00FF;
+}
+
+#right_scroll {
+  height: 1fr;
+}
+
+#trace_up,
+#trace_down,
+#right_up,
+#right_down {
+  height: 1;
+}
+
+#trace {
+  height: auto;
+}
+
+#compare_title {
+  height: 1;
+  padding: 0 1;
+}
+
+#compare {
+  height: 7;
+  padding: 0 1;
+  border: double #00D9FF;
+}
+
+#compare:focus-within {
+  border: double #BD00FF;
+}
+
+#bar {
+  height: 2;
+  padding: 0 1;
+  border: double #00D9FF;
+}
+
+/* Phase-2 pulse accents (toggled by app) */
+
+#left.pulse_a,
+#center.pulse_a,
+#right_wrap.pulse_a,
+#compare.pulse_a {
+  border: double #FFB000;
+}
+
+#left.pulse_b,
+#center.pulse_b,
+#right_wrap.pulse_b,
+#compare.pulse_b {
+  border: double #00FF41;
+}
+
+/* View modes */
+
+Screen.view_focus #left,
+Screen.view_focus #right_wrap,
+Screen.view_focus #compare_title,
+Screen.view_focus #compare {
+  display: none;
+}
+
+.section {
+  color: #A0A0A0;
+  text-style: bold;
+}
+
+.k {
+  color: #A0A0A0;
+  text-style: bold;
+}
+
+#prompt {
+  color: #00D9FF;
+  text-style: bold;
+  width: 1;
+}
+
+Input {
+  border: none;
+  background: #1A1A2E;
+}
+
+Select {
+  border: solid #00D9FF;
+  background: #1A1A2E;
+}
+
+Screen.matrix #left,
+Screen.matrix #center,
+Screen.matrix #right_wrap,
+Screen.matrix #compare,
+Screen.matrix #bar {
+  border: double #00FF00;
+}
+
+Screen.dracula #left,
+Screen.dracula #center,
+Screen.dracula #right_wrap,
+Screen.dracula #compare,
+Screen.dracula #bar {
+  border: double #BD93F9;
+}

@@ -1,0 +1,35 @@
+name: authreferee
+version: 1
+runtime:
+  language: python
+  version: "3.11"
+ui:
+  framework: rich
+  mode: cli
+constraints:
+  state: in_memory_only
+  logic: deterministic_rule_based
+  no_external_apis: true
+  no_ml: true
+options:
+  - Session-based Authentication
+  - JWT-based Authentication
+  - OAuth 2.0
+  - Firebase Authentication
+questions_order:
+  - Application type
+  - Expected number of users
+  - Security sensitivity
+  - Backend architecture
+  - Team experience
+  - Social login required
+output:
+  single_screen: true
+  sections:
+    - Header Panel
+    - User Context Panel
+    - Verdict Panel
+    - Trade-offs Panel
+    - Comparison Table
+    - Rejection Section
+    - Referee Note

@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Textual / tooling
+.textual/
+
+# App outputs
+exports/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
