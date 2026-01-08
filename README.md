@@ -45,8 +45,6 @@ Updated UI (current Textual build):
 
 ![Updated UI](docs/screenshots/updated.png)
 
-> Drop the two screenshots into `docs/screenshots/` as `old.png` and `updated.png`.
-
 ## Roadmap / Change Log (Tree)
 
 ```
