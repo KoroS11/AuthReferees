@@ -75,6 +75,8 @@ Screen.dracula {
 #trace_scroll {
   height: 1fr;
   min-height: 8;
+  overflow-x: hidden;
+  overflow-y: hidden;
 }
 
 #right_wrap {
@@ -94,12 +96,26 @@ Screen.dracula {
 #trace_up,
 #trace_down,
 #right_up,
-#right_down {
+#right_down,
+#left_scroll_up,
+#left_scroll_down {
   height: 1;
+}
+
+#left_scroll {
+  height: 1fr;
+  scrollbar-gutter: stable;
 }
 
 #trace {
   height: auto;
+  width: 100%;
+}
+
+#recommendations {
+  height: auto;
+  width: 100%;
+  margin-top: 1;
 }
 
 #compare_title {
@@ -128,24 +144,60 @@ Screen.dracula {
 #left.pulse_a,
 #center.pulse_a,
 #right_wrap.pulse_a,
-#compare.pulse_a {
+#compare.pulse_a,
+#bar.pulse_a {
   border: double #FFB000;
 }
 
 #left.pulse_b,
 #center.pulse_b,
 #right_wrap.pulse_b,
-#compare.pulse_b {
+#compare.pulse_b,
+#bar.pulse_b {
   border: double #00FF41;
 }
 
 /* View modes */
 
+/* FOCUS: Hide side panels, center takes full width */
 Screen.view_focus #left,
 Screen.view_focus #right_wrap,
 Screen.view_focus #compare_title,
 Screen.view_focus #compare {
   display: none;
+}
+
+Screen.view_focus #center {
+  width: 100%;
+  border: double #BD00FF;
+}
+
+/* DETAILED: Expand trace area, show all panels */
+Screen.view_detailed #trace_scroll {
+  min-height: 16;
+  height: auto;
+}
+
+Screen.view_detailed #center {
+  width: 50%;
+}
+
+Screen.view_detailed #left {
+  width: 25%;
+}
+
+Screen.view_detailed #right_wrap {
+  width: 25%;
+}
+
+/* COMPACT: Shrink trace, emphasize comparison */
+Screen.view_compact #trace_scroll {
+  min-height: 4;
+  max-height: 8;
+}
+
+Screen.view_compact #compare {
+  height: 10;
 }
 
 .section {

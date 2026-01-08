@@ -8,6 +8,7 @@ import time
 import math
 import asyncio
 from dataclasses import dataclass
+from typing import Optional
 
 import psutil
 from rich.text import Text
@@ -17,7 +18,8 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.reactive import reactive
-from textual.widgets import Button, Checkbox, DataTable, Input, Label, Select, Static
+from textual.widget import Widget
+from textual.widgets import Button, Checkbox, DataTable, Input, Label, Select, Static, Tree
 
 from referee.comparison import ComparisonRow, build_comparison_rows
 from referee.models import (
@@ -101,6 +103,175 @@ def _ellipsize(s: str, max_chars: int) -> str:
     if max_chars <= 1:
         return "…"
     return s[: max_chars - 1] + "…"
+
+
+def _wrap_text_lines(text: str, max_width: int, indent: int = 0, first_line_prefix: str = "", continuation_prefix: str = "") -> list[str]:
+    """
+    Wrap text to multiple lines with proper indentation.
+    
+    Args:
+        text: The text to wrap
+        max_width: Maximum width including any prefixes/indentation
+        indent: Number of spaces for continuation line indentation
+        first_line_prefix: Prefix for first line (like "├─ ")
+        continuation_prefix: Prefix for wrapped lines (like "│  ")
+    
+    Returns:
+        List of lines with proper wrapping
+    """
+    if not text or max_width <= 0:
+        return [""]
+    
+    # Normalize whitespace
+    text = " ".join(text.split())
+    
+    # Calculate available width for first line and continuation lines
+    first_width = max_width - len(first_line_prefix)
+    cont_width = max_width - len(continuation_prefix) - indent
+    
+    if first_width <= 0:
+        first_width = 10
+    if cont_width <= 0:
+        cont_width = 10
+    
+    lines: list[str] = []
+    remaining = text
+    is_first = True
+    
+    while remaining:
+        width = first_width if is_first else cont_width
+        
+        if len(remaining) <= width:
+            # Fits on this line
+            if is_first:
+                lines.append(first_line_prefix + remaining)
+            else:
+                lines.append(continuation_prefix + " " * indent + remaining)
+            break
+        
+        # Find break point (prefer space, then hyphenate)
+        break_pos = remaining.rfind(" ", 0, width)
+        if break_pos <= 0:
+            # No space found, break at width with hyphen
+            break_pos = width - 1
+            chunk = remaining[:break_pos] + "-"
+            remaining = remaining[break_pos:]
+        else:
+            chunk = remaining[:break_pos]
+            remaining = remaining[break_pos + 1:]  # Skip the space
+        
+        if is_first:
+            lines.append(first_line_prefix + chunk)
+        else:
+            lines.append(continuation_prefix + " " * indent + chunk)
+        
+        is_first = False
+    
+    return lines if lines else [""]
+
+
+@dataclass
+class _TypeSession:
+    key: str
+    target: str
+    selector: str | None
+    style: str
+    speed_s: float
+    blink: bool
+    i: int = 0
+    done: bool = False
+    next_at: float = 0.0
+
+
+class _Typewriter:
+    """Single typewriter controller for consistent Phase-2 typing UX."""
+
+    def __init__(self, app: "AuthRefereeTextual") -> None:
+        self.app = app
+        self.sessions: dict[str, _TypeSession] = {}
+
+    def start(
+        self,
+        key: str,
+        text: str,
+        *,
+        selector: str | None,
+        style: str = "dim",
+        speed_s: float = 0.02,
+        blink: bool = True,
+    ) -> None:
+        now = time.monotonic()
+        text = text or ""
+        prev = self.sessions.get(key)
+        if prev is not None and prev.target == text and prev.selector == selector:
+            return
+        self.sessions[key] = _TypeSession(
+            key=key,
+            target=text,
+            selector=selector,
+            style=style,
+            speed_s=max(0.005, float(speed_s)),
+            blink=bool(blink),
+            i=0,
+            done=(len(text) == 0),
+            next_at=now,
+        )
+        self._push(key)
+
+    def is_done(self, key: str) -> bool:
+        s = self.sessions.get(key)
+        return True if s is None else bool(s.done)
+
+    def get_display(self, key: str) -> str:
+        s = self.sessions.get(key)
+        if s is None:
+            return ""
+        shown = s.target
+        if not s.done:
+            shown = s.target[: s.i]
+            return shown + "▌"
+        if s.blink:
+            phase = int(getattr(self.app, "_pulse_phase", 0) or 0)
+            return shown + ("▌" if phase % 2 == 0 else " ")
+        return shown
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        any_dirty = False
+        for key, s in list(self.sessions.items()):
+            if s.done:
+                # Still refresh for blink if bound to a widget.
+                if s.selector:
+                    any_dirty = True
+                continue
+            if now < s.next_at:
+                continue
+            s.i += 1
+            if s.i >= len(s.target):
+                s.i = len(s.target)
+                s.done = True
+            s.next_at = now + s.speed_s
+            any_dirty = True
+            self._push(key)
+
+        if any_dirty:
+            # Ensure blink updates are visible.
+            for key in list(self.sessions.keys()):
+                self._push(key)
+
+    def _push(self, key: str) -> None:
+        s = self.sessions.get(key)
+        if s is None or not s.selector:
+            return
+        try:
+            w = self.app.query_one(s.selector)
+        except Exception:
+            return
+        # Widget may be Label or Static; both accept rich Text.
+        try:
+            w.update(Text(self.get_display(key), style=s.style))
+        except Exception:
+            pass
 
 
 class TopBar(Static):
@@ -313,7 +484,14 @@ class ExportScreen(ModalScreen[None]):
             yield Button("Cancel", id="cancel_export")
 
     def on_mount(self) -> None:
-        self.query_one("#export_name", Input).value = "session_export"
+        # Auto-generate filename with session ID and timestamp
+        try:
+            session = str(getattr(self.app.query_one("#top"), "session", "export") or "export")
+        except Exception:
+            session = "export"
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        auto_name = f"authreferee_{session}_{ts}"
+        self.query_one("#export_name", Input).value = auto_name
         self.query_one("#export_name", Input).focus()
 
     @on(Button.Pressed, "#cancel_export")
@@ -363,75 +541,80 @@ class Scanline(Static):
 
 
 class ContextPanel(Static):
-    """Left panel: context & configuration inputs."""
+    """Left panel: context & configuration inputs with scrollbar."""
 
     def compose(self) -> ComposeResult:
-        yield Label("CONTEXT", classes="section")
+        # Scroll indicator at top
+        yield Static("", id="left_scroll_up")
+        with VerticalScroll(id="left_scroll"):
+            yield Label("CONTEXT", classes="section")
 
-        yield Label("⚡ APP", classes="k")
-        yield Select(
-            options=[
-                ("Web", ApplicationType.WEB.value),
-                ("Mobile", ApplicationType.MOBILE.value),
-                ("API", ApplicationType.API.value),
-            ],
-            id="app",
-            value=ApplicationType.WEB.value,
-        )
+            yield Label("⚡ APP", classes="k")
+            yield Select(
+                options=[
+                    ("Web", ApplicationType.WEB.value),
+                    ("Mobile", ApplicationType.MOBILE.value),
+                    ("API", ApplicationType.API.value),
+                ],
+                id="app",
+                value=ApplicationType.WEB.value,
+            )
 
-        yield Label("◉ USERS", classes="k")
-        yield Select(
-            options=[
-                ("< 1,000", ExpectedUsers.LT_1K.value),
-                ("1,000–50,000", ExpectedUsers.BTW_1K_50K.value),
-                ("50,000+", ExpectedUsers.GTE_50K.value),
-            ],
-            id="users",
-            value=ExpectedUsers.BTW_1K_50K.value,
-        )
-        yield Static("", id="users_gauge")
+            yield Label("◉ USERS", classes="k")
+            yield Select(
+                options=[
+                    ("< 1,000", ExpectedUsers.LT_1K.value),
+                    ("1,000–50,000", ExpectedUsers.BTW_1K_50K.value),
+                    ("50,000+", ExpectedUsers.GTE_50K.value),
+                ],
+                id="users",
+                value=ExpectedUsers.BTW_1K_50K.value,
+            )
+            yield Static("", id="users_gauge")
 
-        yield Label("⚿ SEC", classes="k")
-        yield Select(
-            options=[
-                ("Low", SecuritySensitivity.LOW.value),
-                ("Medium", SecuritySensitivity.MEDIUM.value),
-                ("High", SecuritySensitivity.HIGH.value),
-            ],
-            id="sec",
-            value=SecuritySensitivity.MEDIUM.value,
-        )
+            yield Label("⚿ SEC", classes="k")
+            yield Select(
+                options=[
+                    ("Low", SecuritySensitivity.LOW.value),
+                    ("Medium", SecuritySensitivity.MEDIUM.value),
+                    ("High", SecuritySensitivity.HIGH.value),
+                ],
+                id="sec",
+                value=SecuritySensitivity.MEDIUM.value,
+            )
 
-        yield Label("⚙ BACKEND", classes="k")
-        yield Select(
-            options=[
-                ("Stateful", BackendArchitecture.STATEFUL.value),
-                ("Stateless", BackendArchitecture.STATELESS.value),
-            ],
-            id="backend",
-            value=BackendArchitecture.STATELESS.value,
-        )
+            yield Label("⚙ BACKEND", classes="k")
+            yield Select(
+                options=[
+                    ("Stateful", BackendArchitecture.STATEFUL.value),
+                    ("Stateless", BackendArchitecture.STATELESS.value),
+                ],
+                id="backend",
+                value=BackendArchitecture.STATELESS.value,
+            )
 
-        yield Label("◆ TEAM", classes="k")
-        yield Select(
-            options=[
-                ("Beginner", TeamExperience.BEGINNER.value),
-                ("Intermediate", TeamExperience.INTERMEDIATE.value),
-                ("Advanced", TeamExperience.ADVANCED.value),
-            ],
-            id="team",
-            value=TeamExperience.INTERMEDIATE.value,
-        )
+            yield Label("◆ TEAM", classes="k")
+            yield Select(
+                options=[
+                    ("Beginner", TeamExperience.BEGINNER.value),
+                    ("Intermediate", TeamExperience.INTERMEDIATE.value),
+                    ("Advanced", TeamExperience.ADVANCED.value),
+                ],
+                id="team",
+                value=TeamExperience.INTERMEDIATE.value,
+            )
 
-        yield Label("◇ SOCIAL", classes="k")
-        yield Select(
-            options=[
-                ("Yes", SocialLoginRequired.YES.value),
-                ("No", SocialLoginRequired.NO.value),
-            ],
-            id="social",
-            value=SocialLoginRequired.NO.value,
-        )
+            yield Label("◇ SOCIAL", classes="k")
+            yield Select(
+                options=[
+                    ("Yes", SocialLoginRequired.YES.value),
+                    ("No", SocialLoginRequired.NO.value),
+                ],
+                id="social",
+                value=SocialLoginRequired.NO.value,
+            )
+        # Scroll indicator at bottom
+        yield Static("", id="left_scroll_down")
 
 
 class VerdictPanel(Static):
@@ -520,23 +703,636 @@ class VerdictPanel(Static):
         self.update(t)
 
 
-class TracePanel(Static):
-    """Center bottom: decision tree-ish trace (flattened, colored deltas)."""
+class TraceTree(Tree[None]):
+    """Center bottom: expandable decision trace (Tree) with compact summaries."""
+
+    def __init__(self, label: str = "TRACE", **kwargs) -> None:
+        super().__init__(label, **kwargs)
+
+    BINDINGS = [
+        Binding("space", "toggle_node", "Toggle"),
+        Binding("enter", "toggle_node", "Toggle"),
+        Binding("a", "toggle_expand_all", "Expand/Collapse all"),
+    ]
+
+    def on_mount(self) -> None:
+        self.show_root = False
+        self.guide_depth = 4
+
+    def _get_primary_reason(self, scoring: ScoringResult, method) -> str:
+        """Get the most significant reason for a method's score."""
+        reasons = scoring.reasons.get(method, [])
+        # Find the strongest delta (highest absolute value)
+        best_delta = 0.0
+        best_reason = "Base score"
+        for line in reasons:
+            if line.startswith("Base score") or line.startswith("Capped at"):
+                continue
+            if ":" in line:
+                try:
+                    delta_str = line.split(":", 1)[0].strip()
+                    delta = float(delta_str)
+                    if abs(delta) > abs(best_delta):
+                        best_delta = delta
+                        best_reason = line.split(":", 1)[1].strip()
+                except (ValueError, IndexError):
+                    pass
+        return best_reason
+
+    def _get_enable_hint(self, method, ctx: UserContext) -> str:
+        """Get a hint for what would need to change to enable this method."""
+        method_short = _method_short(method.value)
+        
+        if method == AuthMethod.SESSIONS:
+            if ctx.backend_architecture.value == "Stateless":
+                return "Change backend to Stateful"
+            if ctx.application_type.value in ("API", "Mobile"):
+                return "Better suited for Web apps"
+            return "Already optimal for your config"
+        
+        if method == AuthMethod.JWT:
+            if ctx.backend_architecture.value == "Stateful":
+                return "Change backend to Stateless"
+            if ctx.social_login_required == SocialLoginRequired.YES:
+                return "Doesn't handle social login directly"
+            return "Already optimal for your config"
+        
+        if method == AuthMethod.OAUTH2:
+            if ctx.social_login_required == SocialLoginRequired.NO:
+                return "Enable Social Login requirement"
+            return "Already optimal for your config"
+        
+        if method == AuthMethod.FIREBASE:
+            if ctx.application_type.value != "Mobile":
+                return "Best suited for Mobile apps"
+            if ctx.team_experience.value == "Advanced":
+                return "May prefer more control than Firebase offers"
+            return "Already optimal for your config"
+        
+        return "Review scoring factors"
 
     def update_from(self, ctx: UserContext, *, scoring: ScoringResult, verdict: Verdict) -> None:
         if bool(getattr(self.app, "_busy_visible", False)):
             self._render_skeleton()
             return
+
         score_overrides: dict[str, float] = dict(getattr(self.app, "_anim_current_scores", {}) or {})
         flash_keys = set(getattr(self.app, "_active_flash_keys", lambda: set())())
+        open_set: set[str] = getattr(self.app, "_trace_open", set()) or set()
 
         view_mode = str(getattr(self.app, "view_mode", "default") or "default")
-        compact = view_mode == "compact"
+        compact_mode = view_mode == "compact"
 
-        def render_method_trace(method_value: str, score: float, is_win: bool) -> Text:
-            lines = scoring.reasons.get(method_value, [])
+        root = self.root
+        root.remove_children()
+
+        ranked = verdict.ranked
+        if compact_mode:
+            ranked = [(verdict.recommended, scoring.scores[verdict.recommended])]
+
+        win_score = float(score_overrides.get(verdict.recommended.value, scoring.scores[verdict.recommended]))
+        
+        # Calculate available width for text wrapping
+        # Tree widget has some built-in indentation, so we calculate usable width
+        tree_width = max(30, (self.size.width or 50) - 8)  # Account for tree indent and padding
+
+        for method, score in ranked:
+            method_value = method.value
+            method_short = _method_short(method_value)
+            shown = float(score_overrides.get(method_value, score))
+            is_win = method == verdict.recommended
+            is_expanded = (method_value in open_set) if open_set else is_win
+
+            key = f"score:{method_value}"
+            flash = key in flash_keys
+
+            # Get the primary reason for collapsed one-line summary
+            primary_reason = self._get_primary_reason(scoring, method)
+            primary_reason_short = _ellipsize(primary_reason, min(35, tree_width - 25))
+
+            # Status icon and colors
+            status_icon = "✓" if is_win else "✗"
+            status_text = "SELECTED" if is_win else "REJECTED"
+            title_style = "bold #00FF41" if is_win else "bold #FF1F7E"
+            score_style = "bold #00FF41" if is_win else "bold #A0A0A0"
+            if flash:
+                score_style = (score_style + " " + _flash_style(True)).strip()
+
+            # Build compact header with one-line summary
+            # Format: ▼/▶ ✓/✗ Name  Score (STATUS) - Reason
+            header = Text()
+            expand_icon = "▼" if is_expanded else "▶"
+            header.append(f"{expand_icon} ", style="bold #00D9FF")
+            header.append(f"{status_icon} ", style=title_style)
+            header.append(f"{method_short:<10}", style=title_style)
+            header.append(f"{shown:>4.1f}", style=score_style)
+            header.append(f" ({status_text})", style=title_style)
+            
+            # Add delta from winner for non-winners
+            if not is_win:
+                delta = shown - win_score
+                delta_style = "#FFB000" if delta == 0 else "#FF1F7E"
+                header.append(f" {delta:+.1f}", style=f"bold {delta_style}")
+            
+            # Add one-line reason summary (visible when collapsed)
+            if not is_expanded:
+                header.append(" — ", style="dim")
+                header.append(primary_reason_short, style="dim")
+
+            node = root.add(header, data=method_value, expand=is_expanded)
+
+            # Detailed breakdown (only visible when expanded)
+            lines = scoring.reasons.get(method, [])
             base = "5.0"
-            deltas: list[str] = []
+            deltas: list[tuple[str, str]] = []
+            cap_line: str | None = None
+            
+            for line in lines:
+                if line.startswith("Base score"):
+                    base = line.split(":", 1)[1].strip()
+                    continue
+                if line.startswith("Capped at"):
+                    cap_line = line
+                    continue
+                if ":" in line:
+                    delta_part, reason_part = line.split(":", 1)
+                    deltas.append((delta_part.strip(), reason_part.strip()))
+                else:
+                    deltas.append(("", line))
+
+            # ── BASE ──
+            base_row = Text()
+            base_row.append("  ├─ ", style="dim #00D9FF")
+            base_row.append("BASE ", style="bold #00D9FF")
+            base_row.append(base, style="bold #FFFFFF")
+            node.add_leaf(base_row)
+
+            # ── DELTAS with text wrapping ──
+            # Calculate usable width for reason text (after tree symbols and delta value)
+            reason_width = max(20, tree_width - 15)  # 15 chars for "  ├─ ▲ +2.00  "
+            
+            for i, (delta_str, reason) in enumerate(deltas):
+                is_last_delta = (i == len(deltas) - 1) and cap_line is None
+                prefix = "  └─ " if is_last_delta else "  ├─ "
+                cont_prefix = "  │     " if not is_last_delta else "        "
+
+                if not delta_str:
+                    # No delta value, just reason text
+                    wrapped = _wrap_text_lines(reason, reason_width + 8, indent=0, first_line_prefix="", continuation_prefix="")
+                    for j, chunk in enumerate(wrapped):
+                        row = Text()
+                        if j == 0:
+                            row.append(prefix, style="dim")
+                        else:
+                            row.append(cont_prefix, style="dim")
+                        row.append(chunk, style="")
+                        node.add_leaf(row)
+                    continue
+
+                is_positive = delta_str.startswith("+")
+                is_negative = delta_str.startswith("-")
+                delta_color = "#00FF41" if is_positive else "#FF1F7E" if is_negative else "#FFB000"
+                arrow = "▲" if is_positive else "▼" if is_negative else "●"
+
+                # Wrap the reason text
+                wrapped = _wrap_text_lines(reason, reason_width, indent=0, first_line_prefix="", continuation_prefix="")
+                
+                for j, chunk in enumerate(wrapped):
+                    row = Text()
+                    if j == 0:
+                        # First line with delta value
+                        row.append(prefix, style="dim")
+                        row.append(f"{arrow} ", style=f"bold {delta_color}")
+                        row.append(f"{delta_str:>5}", style=f"bold {delta_color}")
+                        row.append("  ", style="dim")
+                        row.append(chunk, style="")
+                    else:
+                        # Continuation line - indent to align with text start
+                        row.append(cont_prefix, style="dim")
+                        row.append("       ", style="")  # Align with text after delta
+                        row.append(chunk, style="")
+                    node.add_leaf(row)
+
+            # ── FINAL ──
+            has_more_after_final = cap_line is not None or not is_win
+            final_prefix = "  ├─ " if has_more_after_final else "  └─ "
+            final_row = Text()
+            final_row.append(final_prefix, style="dim")
+            final_style = "#00FF41" if is_win else "#FFFFFF"
+            if flash:
+                final_style = "#FFB000"
+            final_row.append("══ FINAL ", style="bold")
+            final_row.append(f"{shown:.1f}", style=f"bold {final_style}")
+            final_row.append(" ══", style="bold")
+            node.add_leaf(final_row)
+
+            # ── CAP NOTE with wrapping ──
+            if cap_line:
+                has_hint = not is_win
+                cap_prefix = "  ├─ " if has_hint else "  └─ "
+                cap_cont = "  │     " if has_hint else "        "
+                
+                wrapped = _wrap_text_lines(cap_line, reason_width + 5, indent=0, first_line_prefix="", continuation_prefix="")
+                for j, chunk in enumerate(wrapped):
+                    cap_row = Text()
+                    if j == 0:
+                        cap_row.append(cap_prefix, style="dim")
+                        cap_row.append("⚠ ", style="bold #FFB000")
+                        cap_row.append(chunk, style="dim #FFB000")
+                    else:
+                        cap_row.append(cap_cont, style="dim")
+                        cap_row.append("  ", style="")  # Align with text after icon
+                        cap_row.append(chunk, style="dim #FFB000")
+                    node.add_leaf(cap_row)
+
+            # ── ENABLE HINT for rejected methods with wrapping ──
+            if not is_win:
+                hint = self._get_enable_hint(method, ctx)
+                hint_text = f"To enable: {hint}"
+                wrapped = _wrap_text_lines(hint_text, reason_width + 5, indent=0, first_line_prefix="", continuation_prefix="")
+                
+                for j, chunk in enumerate(wrapped):
+                    hint_row = Text()
+                    if j == 0:
+                        hint_row.append("  └─ ", style="dim")
+                        hint_row.append("💡 ", style="bold #BD00FF")
+                        hint_row.append(chunk, style="#BD00FF")
+                    else:
+                        hint_row.append("        ", style="dim")
+                        hint_row.append("  ", style="")  # Align with text
+                        hint_row.append(chunk, style="#BD00FF")
+                    node.add_leaf(hint_row)
+
+        if not ranked:
+            root.add_leaf(Text("(no trace)", style="dim"))
+
+    def _render_skeleton(self) -> None:
+        phase = int(getattr(self.app, "_pulse_phase", 0) or 0)
+        root = self.root
+        root.remove_children()
+
+        for i, pct in enumerate((78.0, 66.0, 72.0, 58.0), start=1):
+            hdr = Text(f"  METHOD {i}", style="dim")
+            node = root.add(hdr, expand=(i == 1))
+            # Skeleton matches the detailed format
+            bar = _bar_shimmer(pct, 16, phase)
+            base_row = Text()
+            base_row.append("├─ ", style="dim #00D9FF")
+            base_row.append("BASE ", style="dim #00D9FF")
+            base_row.append("5.0", style="dim")
+            node.add_leaf(base_row)
+
+            delta_row = Text()
+            delta_row.append("├─ ", style="dim")
+            delta_row.append("▲ ", style="dim #00FF41")
+            delta_row.append(f"+-.--  loading {bar}", style="dim")
+            node.add_leaf(delta_row)
+
+            final_row = Text()
+            final_row.append("└─ ", style="dim")
+            final_row.append("═══ FINAL ", style="dim")
+            final_row.append("--.--", style="dim")
+            final_row.append(" ═══", style="dim")
+            node.add_leaf(final_row)
+
+    @on(Tree.NodeExpanded)
+    def _on_node_expanded(self, event: Tree.NodeExpanded) -> None:
+        data = getattr(event.node, "data", None)
+        if isinstance(data, str) and data:
+            self.app._trace_open.add(data)
+
+    @on(Tree.NodeCollapsed)
+    def _on_node_collapsed(self, event: Tree.NodeCollapsed) -> None:
+        data = getattr(event.node, "data", None)
+        if isinstance(data, str) and data:
+            self.app._trace_open.discard(data)
+
+    def action_toggle_expand_all(self) -> None:
+        """Toggle expand/collapse all method nodes."""
+        open_set = self.app._trace_open
+        # If any are open, collapse all; otherwise expand all
+        all_keys: set[str] = set()
+        for node in self.root.children:
+            data = getattr(node, "data", None)
+            if isinstance(data, str) and data:
+                all_keys.add(data)
+
+        if open_set & all_keys:  # Some are open -> collapse all
+            for node in self.root.children:
+                try:
+                    node.collapse()
+                except Exception:
+                    pass
+            self.app._trace_open = set()
+        else:  # None open -> expand all
+            for node in self.root.children:
+                try:
+                    node.expand()
+                except Exception:
+                    pass
+                data = getattr(node, "data", None)
+                if isinstance(data, str) and data:
+                    open_set.add(data)
+            self.app._trace_open = open_set
+
+
+class TraceViewport(Widget):
+    """TRACE renderer with strict wrapping + vertical-only scrolling.
+
+    This avoids Tree label truncation and allows drawing a manual scrollbar
+    inside the TRACE area.
+    """
+
+    can_focus = True
+
+    BINDINGS = [
+        Binding("up", "scroll_up", "Up"),
+        Binding("down", "scroll_down", "Down"),
+        Binding("pageup", "page_up", "PgUp"),
+        Binding("pagedown", "page_down", "PgDn"),
+        Binding("home", "scroll_top", "Top"),
+        Binding("end", "scroll_bottom", "Bottom"),
+        Binding("a", "toggle_expand_all", "Expand/Collapse all"),
+    ]
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._lines: list[tuple[str, str]] = []
+        self._scroll_y: int = 0
+        self._line_method_headers: dict[int, str] = {}
+
+    @property
+    def scroll_y(self) -> int:
+        return int(self._scroll_y)
+
+    @property
+    def max_scroll_y(self) -> int:
+        h = int(self.size.height or 0)
+        total = len(self._lines)
+        return max(0, total - max(1, h))
+
+    def _clamp_scroll(self) -> None:
+        self._scroll_y = max(0, min(self._scroll_y, self.max_scroll_y))
+
+    def action_scroll_up(self) -> None:
+        self._scroll_y -= 1
+        self._clamp_scroll()
+        self.refresh()
+
+    def action_scroll_down(self) -> None:
+        self._scroll_y += 1
+        self._clamp_scroll()
+        self.refresh()
+
+    def action_page_up(self) -> None:
+        self._scroll_y -= max(1, int(self.size.height or 1) - 1)
+        self._clamp_scroll()
+        self.refresh()
+
+    def action_page_down(self) -> None:
+        self._scroll_y += max(1, int(self.size.height or 1) - 1)
+        self._clamp_scroll()
+        self.refresh()
+
+    def action_scroll_top(self) -> None:
+        self._scroll_y = 0
+        self.refresh()
+
+    def action_scroll_bottom(self) -> None:
+        self._scroll_y = self.max_scroll_y
+        self.refresh()
+
+    def action_toggle_expand_all(self) -> None:
+        open_set: set[str] = set(getattr(self.app, "_trace_open", set()) or set())
+        all_keys: set[str] = set()
+        for _method_value, _style in self._method_keys_in_last_render():
+            all_keys.add(_method_value)
+
+        if open_set & all_keys:
+            self.app._trace_open = set()
+        else:
+            self.app._trace_open = set(all_keys)
+        self.refresh()
+
+    def _method_keys_in_last_render(self) -> list[tuple[str, str]]:
+        # We don't need styles here; keep a stable ordered list of method keys.
+        ordered: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for _, method_value in sorted((k, v) for (k, v) in self._line_method_headers.items()):
+            if method_value not in seen:
+                seen.add(method_value)
+                ordered.append((method_value, ""))
+        return ordered
+
+    def _get_primary_reason(self, scoring: ScoringResult, method) -> str:
+        reasons = scoring.reasons.get(method, [])
+        best_delta = 0.0
+        best_reason = "Base score"
+        for line in reasons:
+            if line.startswith("Base score") or line.startswith("Capped at"):
+                continue
+            if ":" in line:
+                try:
+                    delta_str = line.split(":", 1)[0].strip()
+                    delta = float(delta_str)
+                    if abs(delta) > abs(best_delta):
+                        best_delta = delta
+                        best_reason = line.split(":", 1)[1].strip()
+                except (ValueError, IndexError):
+                    pass
+        return best_reason
+
+    def _get_enable_hint(self, method, ctx: UserContext) -> str:
+        if method == AuthMethod.SESSIONS:
+            if ctx.backend_architecture.value == "Stateless":
+                return "Change backend to Stateful"
+            if ctx.application_type.value in ("API", "Mobile"):
+                return "Better suited for Web apps"
+            return "Already optimal for your config"
+
+        if method == AuthMethod.JWT:
+            if ctx.backend_architecture.value == "Stateful":
+                return "Change backend to Stateless"
+            if ctx.social_login_required == SocialLoginRequired.YES:
+                return "Doesn't handle social login directly"
+            return "Already optimal for your config"
+
+        if method == AuthMethod.OAUTH2:
+            if ctx.social_login_required == SocialLoginRequired.NO:
+                return "Enable Social Login requirement"
+            return "Already optimal for your config"
+
+        if method == AuthMethod.FIREBASE:
+            if ctx.application_type.value != "Mobile":
+                return "Best suited for Mobile apps"
+            if ctx.team_experience.value == "Advanced":
+                return "May prefer more control than Firebase offers"
+            return "Already optimal for your config"
+
+        return "Review scoring factors"
+
+    def _add_wrapped(
+        self,
+        out: list[tuple[str, str]],
+        text: str,
+        *,
+        max_width: int,
+        first_prefix: str,
+        continuation_prefix: str,
+        style: str,
+    ) -> None:
+        for line in _wrap_text_lines(
+            text,
+            max_width,
+            indent=0,
+            first_line_prefix=first_prefix,
+            continuation_prefix=continuation_prefix,
+        ):
+            out.append((line, style))
+
+    def _build_recommendations_lines(self, ctx: UserContext, verdict: Verdict, *, content_width: int) -> list[tuple[str, str]]:
+        box_width = max(20, int(content_width))
+        inner_width = max(10, box_width - 4)
+        lines: list[tuple[str, str]] = []
+
+        title = " RECOMMENDATIONS "
+        side_len = max(0, (box_width - len(title) - 2) // 2)
+        top_border = "┌" + ("─" * side_len) + title + ("─" * (box_width - 2 - side_len - len(title))) + "┐"
+        bot_border = "└" + ("─" * (box_width - 2)) + "┘"
+        lines.append((top_border, "bold #BD00FF"))
+
+        winner = verdict.recommended
+        winner_short = _method_short(winner.value)
+
+        caveats: list[str] = []
+        if winner == AuthMethod.SESSIONS:
+            if ctx.expected_users.value == "50,000+":
+                caveats.append("Consider Redis/Memcached for session storage at scale")
+            if ctx.backend_architecture.value == "Stateless":
+                caveats.append("Requires sticky sessions or shared session store")
+            caveats.append("Implement CSRF protection and secure cookie settings")
+        elif winner == AuthMethod.JWT:
+            caveats.append("Implement token refresh and rotation strategy")
+            if ctx.security_sensitivity.value == "High":
+                caveats.append("Add token blacklisting for immediate revocation")
+            caveats.append("Store tokens securely (httpOnly cookies for web)")
+        elif winner == AuthMethod.OAUTH2:
+            caveats.append("Set up proper redirect URI validation")
+            if ctx.team_experience.value == "Beginner":
+                caveats.append("Consider using a well-tested OAuth library")
+            caveats.append("Implement state parameter to prevent CSRF")
+        elif winner == AuthMethod.FIREBASE:
+            if ctx.expected_users.value == "50,000+":
+                caveats.append("Review Firebase pricing for high-volume usage")
+            caveats.append("Plan migration strategy if you outgrow Firebase")
+
+        caveats = caveats[:2]
+
+        def box_row(text: str, style: str = "") -> None:
+            wrapped = _wrap_text_lines(text, inner_width, indent=0, first_line_prefix="", continuation_prefix="")
+            for chunk in wrapped:
+                padded = chunk.ljust(inner_width)
+                lines.append((f"│ {padded} │", style))
+
+        if caveats:
+            box_row(f"Using {winner_short}:", "bold #00FF41")
+            for c in caveats:
+                box_row(f"→ {c}", "")
+        else:
+            box_row(f"Using {winner_short}:", "bold #00FF41")
+            box_row("→ No special caveats detected", "dim")
+
+        # Alternatives (max 2)
+        alts: list[tuple[str, str]] = []
+        for method, _score in verdict.ranked:
+            if method == verdict.recommended:
+                continue
+            method_short = _method_short(method.value)
+            hint = self._get_enable_hint(method, ctx)
+            alts.append((method_short, hint))
+        alts = alts[:2]
+
+        if alts:
+            box_row("", "")
+            box_row("Rejected options (how to enable):", "bold #FF1F7E")
+            for short, hint in alts:
+                box_row(f"→ {short}: To enable this: {hint}", "")
+
+        lines.append((bot_border, "bold #BD00FF"))
+        return lines
+
+    def update_from(self, ctx: UserContext, *, scoring: ScoringResult, verdict: Verdict) -> None:
+        if bool(getattr(self.app, "_busy_visible", False)):
+            self._lines = [("loading…", "dim")]
+            self._scroll_y = 0
+            self.refresh()
+            return
+
+        score_overrides: dict[str, float] = dict(getattr(self.app, "_anim_current_scores", {}) or {})
+        flash_keys = set(getattr(self.app, "_active_flash_keys", lambda: set())())
+        open_set: set[str] = getattr(self.app, "_trace_open", set()) or set()
+
+        view_mode = str(getattr(self.app, "view_mode", "default") or "default")
+        compact_mode = view_mode == "compact"
+
+        # Reserve 1 column for the manual scrollbar.
+        content_width = max(24, (self.size.width or 60) - 1)
+
+        ranked = verdict.ranked
+        if compact_mode:
+            ranked = [(verdict.recommended, scoring.scores[verdict.recommended])]
+
+        win_score = float(score_overrides.get(verdict.recommended.value, scoring.scores[verdict.recommended]))
+
+        out: list[tuple[str, str]] = []
+        self._line_method_headers = {}
+
+        for method, score in ranked:
+            method_value = method.value
+            method_short = _method_short(method_value)
+            shown = float(score_overrides.get(method_value, score))
+            is_win = method == verdict.recommended
+            is_expanded = (method_value in open_set) if open_set else is_win
+
+            key = f"score:{method_value}"
+            flash = key in flash_keys
+
+            expand_icon = "▼" if is_expanded else "▶"
+            status_icon = "✓" if is_win else "✗"
+            status_text = "SELECTED" if is_win else "REJECTED"
+
+            header = f"{expand_icon} {status_icon} {method_short:<10} {shown:>4.1f} ({status_text})"
+            if not is_win:
+                delta = shown - win_score
+                header += f" {delta:+.1f}"
+
+            header_style = "bold #00FF41" if is_win else "bold #FF1F7E"
+            if flash:
+                header_style = (header_style + " " + _flash_style(True)).strip()
+
+            header_lines = _wrap_text_lines(header, content_width, indent=0, first_line_prefix="", continuation_prefix="│ ")
+            for i, hl in enumerate(header_lines):
+                if i == 0:
+                    self._line_method_headers[len(out)] = method_value
+                out.append((hl, header_style))
+
+            primary_reason = self._get_primary_reason(scoring, method)
+            if not is_expanded:
+                self._add_wrapped(
+                    out,
+                    primary_reason,
+                    max_width=content_width,
+                    first_prefix="│  — ",
+                    continuation_prefix="│    ",
+                    style="dim",
+                )
+                out.append(("", ""))
+                continue
+
+            # Expanded: show BASE/DELTAS/FINAL + enable hint for rejected.
+            lines = scoring.reasons.get(method, [])
+            base = "5.0"
+            deltas: list[tuple[str, str]] = []
             cap_line: str | None = None
 
             for line in lines:
@@ -546,81 +1342,353 @@ class TracePanel(Static):
                 if line.startswith("Capped at"):
                     cap_line = line
                     continue
-                deltas.append(line)
+                if ":" in line:
+                    delta_part, reason_part = line.split(":", 1)
+                    deltas.append((delta_part.strip(), reason_part.strip()))
+                else:
+                    deltas.append(("", line.strip()))
 
-            out = Text()
-            title_style = "bold #00FF41" if is_win else "bold #A0A0A0"
-            out.append(_method_short(method_value), style=title_style)
-            out.append("  ", style="dim")
-            key = f"score:{method_value}"
-            flash = key in flash_keys
-            score_style = ("bold #00FF41" if is_win else "bold")
-            if flash:
-                score_style = (score_style + " " + _flash_style(True)).strip()
-            out.append(f"{score:.1f}", style=score_style)
-            out.append("  ", style="dim")
-            out.append("(SELECTED)" if is_win else "(REJECTED)", style=("bold #00FF41" if is_win else "bold #FF1F7E"))
-            out.append("\n")
-            out.append(f"┗━━ BASE {base}\n", style="bold #00D9FF")
+            out.append((f"│  ├─ BASE {base}", "dim #00D9FF"))
 
-            for d in deltas:
-                left, right = d.split(":", 1)
-                left = left.strip()
-                right = right.strip()
-                style = "green" if left.startswith("+") else "red" if left.startswith("-") else "yellow"
-                arrow = "↑" if left.startswith("+") else "↓" if left.startswith("-") else "·"
-                out.append("   ┣━━ ")
-                out.append(f"{arrow} {left}", style=f"bold {style}")
-                out.append(" ")
-                out.append(right)
-                out.append("\n")
+            for i, (delta_str, reason) in enumerate(deltas):
+                is_last_delta = (i == len(deltas) - 1)
+                branch = "└─" if is_last_delta and cap_line is None and is_win else "├─"
+                if delta_str:
+                    is_positive = delta_str.startswith("+")
+                    is_negative = delta_str.startswith("-")
+                    arrow = "▲" if is_positive else "▼" if is_negative else "●"
+                    prefix = f"│  {branch} {arrow} {delta_str:>5}  "
+                else:
+                    prefix = f"│  {branch} "
 
-            out.append("   ┗━━ FINAL ", style="bold #FFFFFF")
-            final_style = ("bold #00FF41" if is_win else "bold #FFFFFF")
-            if flash:
-                final_style = (final_style + " " + _flash_style(True)).strip()
-            out.append(f"{score:.1f}", style=final_style)
-            out.append("\n")
-            if cap_line:
-                out.append("      ")
-                out.append(cap_line, style="dim")
-                out.append("\n")
-            return out
+                cont_prefix = "│  │" + (" " * max(0, len(prefix) - len("│  │")))
+                self._add_wrapped(
+                    out,
+                    reason,
+                    max_width=content_width,
+                    first_prefix=prefix,
+                    continuation_prefix=cont_prefix,
+                    style="",
+                )
+
+            has_more_after_final = cap_line is not None or not is_win
+            final_branch = "├─" if has_more_after_final else "└─"
+            out.append((f"│  {final_branch} FINAL {shown:.1f}", "bold #00FF41" if is_win else "bold #A0A0A0"))
+
+            if cap_line is not None:
+                cap_text = cap_line.split(":", 1)[1].strip() if ":" in cap_line else cap_line
+                cap_branch = "├─" if not is_win else "└─"
+                self._add_wrapped(
+                    out,
+                    f"CAPPED AT: {cap_text}",
+                    max_width=content_width,
+                    first_prefix=f"│  {cap_branch} ",
+                    continuation_prefix="│      ",
+                    style="dim #FFB000",
+                )
+
+            if not is_win:
+                hint = self._get_enable_hint(method, ctx)
+                self._add_wrapped(
+                    out,
+                    f"To enable this: {hint}",
+                    max_width=content_width,
+                    first_prefix="│  └─ ",
+                    continuation_prefix="│     ",
+                    style="dim",
+                )
+
+            out.append(("", ""))
+
+        # Recommendations box beneath trace.
+        rec_lines = self._build_recommendations_lines(ctx, verdict, content_width=content_width)
+        out.extend(rec_lines)
+
+        # Safety pass: if any line still exceeds the viewport width, wrap it
+        # instead of truncating. This keeps TRACE strictly vertical-scroll only.
+        normalized: list[tuple[str, str]] = []
+        for line, style in out:
+            if not line:
+                normalized.append(("", style))
+                continue
+            if len(line) <= content_width:
+                normalized.append((line, style))
+                continue
+            wrapped = _wrap_text_lines(line, content_width, indent=0, first_line_prefix="", continuation_prefix="│ ")
+            for wline in wrapped:
+                normalized.append((wline, style))
+
+        self._lines = normalized
+        self._clamp_scroll()
+        self.refresh()
+
+    def on_mouse_scroll_up(self, _event) -> None:
+        self.action_scroll_up()
+
+    def on_mouse_scroll_down(self, _event) -> None:
+        self.action_scroll_down()
+
+    def on_click(self, event) -> None:
+        # Toggle expansion when clicking a header line.
+        y = int(getattr(event, "y", 0) or 0)
+        idx = self._scroll_y + y
+        method_value = self._line_method_headers.get(idx)
+        if not method_value:
+            return
+        open_set: set[str] = set(getattr(self.app, "_trace_open", set()) or set())
+        if method_value in open_set:
+            open_set.discard(method_value)
+        else:
+            open_set.add(method_value)
+        self.app._trace_open = open_set
+        self.refresh()
+
+    def render(self) -> Text:
+        w = int(self.size.width or 1)
+        h = int(self.size.height or 1)
+        content_width = max(1, w - 1)
+
+        total = len(self._lines)
+        self._clamp_scroll()
+        start = self._scroll_y
+        end = min(total, start + h)
+
+        # Scrollbar thumb math (proportional).
+        if total <= h:
+            thumb_start = 0
+            thumb_len = 0
+        else:
+            thumb_len = max(1, int(round((h * h) / max(1, total))))
+            thumb_len = min(h, thumb_len)
+            max_pos = max(1, h - thumb_len)
+            thumb_start = int(round((start * max_pos) / max(1, total - h)))
 
         t = Text()
-        # Show the full scoring trace for every option (ranked), not just the winner.
-        ranked = verdict.ranked
-        if compact:
-            ranked = [(verdict.recommended, scoring.scores[verdict.recommended])]
+        for i in range(h):
+            abs_i = start + i
+            if abs_i < end:
+                line, style = self._lines[abs_i]
+            else:
+                line, style = ("", "")
 
-        for i, (method, score) in enumerate(ranked):
-            if i:
-                t.append("\n")
-                t.append(Text("─" * max(10, (self.size.width or 60) - 2) + "\n", style="dim"))
-                t.append("\n")
-            shown = float(score_overrides.get(method.value, score))
-            t.append(render_method_trace(method.value, shown, method == verdict.recommended))
+            # Ensure vertical-only view: content is hard-wrapped upstream.
+            padded = (line or "")
+            if len(padded) < content_width:
+                padded = padded.ljust(content_width)
 
+            # Track uses ║ when scrollable, │ when not.
+            if total <= h:
+                bar = "│"
+                bar_style = "dim #00D9FF"
+            else:
+                in_thumb = thumb_start <= i < (thumb_start + thumb_len)
+                bar = "█" if in_thumb else "║"
+                bar_style = "bold #00D9FF" if in_thumb else "dim #00D9FF"
+
+            t.append(padded, style=style)
+            t.append(bar, style=bar_style)
+            if i != h - 1:
+                t.append("\n")
+        return t
+
+
+class RecommendationsPanel(Static):
+    """Smart recommendations based on current selection and rejected alternatives."""
+
+    def _get_winner_caveats(self, winner: AuthMethod, ctx: UserContext) -> list[str]:
+        """Get implementation caveats for the selected method."""
+        caveats = []
+        
+        if winner == AuthMethod.SESSIONS:
+            if ctx.expected_users.value == "50,000+":
+                caveats.append("Consider Redis/Memcached for session storage at scale")
+            if ctx.backend_architecture.value == "Stateless":
+                caveats.append("Requires sticky sessions or shared session store")
+            caveats.append("Implement CSRF protection and secure cookie settings")
+        
+        elif winner == AuthMethod.JWT:
+            caveats.append("Implement token refresh and rotation strategy")
+            if ctx.security_sensitivity.value == "High":
+                caveats.append("Add token blacklisting for immediate revocation")
+            caveats.append("Store tokens securely (httpOnly cookies for web)")
+        
+        elif winner == AuthMethod.OAUTH2:
+            caveats.append("Set up proper redirect URI validation")
+            if ctx.team_experience.value == "Beginner":
+                caveats.append("Consider using a well-tested OAuth library")
+            caveats.append("Implement state parameter to prevent CSRF")
+        
+        elif winner == AuthMethod.FIREBASE:
+            if ctx.expected_users.value == "50,000+":
+                caveats.append("Review Firebase pricing for high-volume usage")
+            caveats.append("Plan migration strategy if you outgrow Firebase")
+        
+        return caveats[:2]  # Max 2 caveats
+
+    def _get_alternatives(self, verdict: Verdict, ctx: UserContext) -> list[tuple[str, str]]:
+        """Get alternatives with what needs to change."""
+        alternatives = []
+        
+        for method, score in verdict.ranked:
+            if method == verdict.recommended:
+                continue
+            
+            method_short = _method_short(method.value)
+            
+            # Determine what would need to change
+            if method == AuthMethod.JWT:
+                if ctx.backend_architecture.value == "Stateful":
+                    hint = "if you switch to Stateless backend"
+                elif ctx.social_login_required == SocialLoginRequired.YES:
+                    hint = "combine with OAuth for social login"
+                else:
+                    hint = "viable alternative, lower tie-break score"
+            
+            elif method == AuthMethod.SESSIONS:
+                if ctx.backend_architecture.value == "Stateless":
+                    hint = "if you switch to Stateful backend"
+                elif ctx.application_type.value in ("API", "Mobile"):
+                    hint = "better suited for Web applications"
+                else:
+                    hint = "viable alternative, consider complexity"
+            
+            elif method == AuthMethod.OAUTH2:
+                if ctx.social_login_required == SocialLoginRequired.NO:
+                    hint = "if you need Social Login in future"
+                else:
+                    hint = "viable for delegated identity"
+            
+            elif method == AuthMethod.FIREBASE:
+                if ctx.application_type.value != "Mobile":
+                    hint = "best suited for Mobile apps"
+                else:
+                    hint = "good for rapid prototyping"
+            else:
+                hint = "review scoring factors"
+            
+            alternatives.append((method_short, hint))
+        
+        return alternatives[:2]  # Max 2 alternatives
+
+    def _wrap_box_line(self, text: str, inner_width: int, style: str = "") -> list[Text]:
+        """Wrap text inside a box with │ borders on both sides."""
+        lines: list[Text] = []
+        wrapped = _wrap_text_lines(text, inner_width, indent=0, first_line_prefix="", continuation_prefix="")
+        for i, chunk in enumerate(wrapped):
+            row = Text()
+            padded = chunk.ljust(inner_width)[:inner_width]
+            row.append("│ ", style="bold #BD00FF")
+            row.append(padded, style=style)
+            row.append(" │", style="bold #BD00FF")
+            lines.append(row)
+        return lines
+
+    def update_from(self, ctx: UserContext, *, verdict: Verdict) -> None:
+        if bool(getattr(self.app, "_busy_visible", False)):
+            self._render_skeleton()
+            return
+
+        # Calculate box width based on available space
+        box_width = max(40, (self.size.width or 45) - 2)
+        inner_width = box_width - 4  # Account for "│ " on left and " │" on right
+        
+        winner = verdict.recommended
+        winner_short = _method_short(winner.value)
+        
+        t = Text()
+        
+        # Top border with title
+        title = " RECOMMENDATIONS "
+        side_len = max(0, (box_width - len(title) - 2) // 2)
+        top_border = "┌" + ("─" * side_len) + title + ("─" * (box_width - 2 - side_len - len(title))) + "┐"
+        t.append(top_border + "\n", style="bold #BD00FF")
+        
+        # Winner caveats section
+        caveats = self._get_winner_caveats(winner, ctx)
+        if caveats:
+            # Section header
+            header_text = f"Using {winner_short}:"
+            t.append("│ ", style="bold #BD00FF")
+            t.append(header_text.ljust(inner_width)[:inner_width], style="bold #00FF41")
+            t.append(" │\n", style="bold #BD00FF")
+            
+            for caveat in caveats:
+                # Wrap caveat text with arrow prefix
+                arrow_prefix = "→ "
+                caveat_text = arrow_prefix + caveat
+                wrapped = _wrap_text_lines(caveat_text, inner_width, indent=2, first_line_prefix="", continuation_prefix="")
+                for line_chunk in wrapped:
+                    t.append("│ ", style="bold #BD00FF")
+                    t.append(line_chunk.ljust(inner_width)[:inner_width], style="#00FF41")
+                    t.append(" │\n", style="bold #BD00FF")
+        
+        # Empty line separator
+        t.append("│ ", style="bold #BD00FF")
+        t.append(" " * inner_width, style="")
+        t.append(" │\n", style="bold #BD00FF")
+        
+        # Alternatives section
+        alternatives = self._get_alternatives(verdict, ctx)
+        if alternatives:
+            # Section header
+            t.append("│ ", style="bold #BD00FF")
+            t.append("Alternatives:".ljust(inner_width)[:inner_width], style="bold #FFB000")
+            t.append(" │\n", style="bold #BD00FF")
+            
+            for alt_name, alt_hint in alternatives:
+                alt_text = f"→ {alt_name}: {alt_hint}"
+                wrapped = _wrap_text_lines(alt_text, inner_width, indent=2, first_line_prefix="", continuation_prefix="")
+                for line_chunk in wrapped:
+                    t.append("│ ", style="bold #BD00FF")
+                    t.append(line_chunk.ljust(inner_width)[:inner_width], style="#FFB000")
+                    t.append(" │\n", style="bold #BD00FF")
+        
+        # Bottom border
+        bottom_border = "└" + ("─" * (box_width - 2)) + "┘"
+        t.append(bottom_border, style="bold #BD00FF")
+        
         self.update(t)
 
     def _render_skeleton(self) -> None:
         phase = int(getattr(self.app, "_pulse_phase", 0) or 0)
-        w = max(20, self.size.width or 60)
-        # A few stable placeholder blocks with shimmer.
+        bar = _bar_shimmer(65.0, 16, phase)
+        
+        box_width = max(40, (self.size.width or 45) - 2)
+        inner_width = box_width - 4
+        
         t = Text()
-        t.append("LOADING TRACE\n", style="bold dim")
-        for _i, pct in enumerate((82.0, 68.0, 76.0, 54.0, 64.0), start=1):
-            bar = _bar_shimmer(pct, max(10, min(40, w - 6)), phase)
-            t.append("  ", style="dim")
-            t.append(bar, style="dim #00D9FF")
-            t.append("\n")
+        
+        # Top border
+        title = " RECOMMENDATIONS "
+        side_len = max(0, (box_width - len(title) - 2) // 2)
+        top_border = "┌" + ("─" * side_len) + title + ("─" * (box_width - 2 - side_len - len(title))) + "┐"
+        t.append(top_border + "\n", style="dim #BD00FF")
+        
+        # Loading content
+        loading_line = f"loading {bar}"
+        t.append("│ ", style="dim #BD00FF")
+        t.append(loading_line.ljust(inner_width)[:inner_width], style="dim")
+        t.append(" │\n", style="dim #BD00FF")
+        
+        # Bottom border
+        bottom_border = "└" + ("─" * (box_width - 2)) + "┘"
+        t.append(bottom_border, style="dim #BD00FF")
+        
         self.update(t)
 
 
 class RightPanel(Static):
     """Right: costs + breaks + losers."""
 
-    def _boxed(self, title: str, body_lines: list[str], *, icon: str, color: str) -> Text:
+    def _boxed(
+        self,
+        title: str,
+        body_lines: list[str],
+        *,
+        icon: str,
+        color: str,
+        changed_indices: set[int] | None = None,
+    ) -> Text:
         max_width = self.size.width or 36
         width = max(24, min(48, max_width))
         inner = max(10, width - 2)
@@ -635,10 +1703,20 @@ class RightPanel(Static):
 
         out = Text()
         out.append(top + "\n", style=f"bold {color}")
-        for raw in body_lines:
-            wrapped = textwrap.wrap(raw, width=inner - 4) or [""]
-            for wline in wrapped:
-                line = f"{icon} {wline}".ljust(inner)[:inner]
+        changed = changed_indices or set()
+
+        # Keep pointer spacing consistent across sections.
+        # This is the total prefix width inside the box (bullet + spaces).
+        pointer_pad = 2  # e.g. "▣ " / "▶ "
+        wrap_width = max(1, inner - pointer_pad)
+        for idx, raw in enumerate(body_lines):
+            wrapped = textwrap.wrap(raw, width=wrap_width) or [""]
+            bullet = "▶" if idx in changed else icon
+            for j, wline in enumerate(wrapped):
+                # Only show the bullet on the first wrapped line; continuation
+                # lines align under the text for readability.
+                prefix = (bullet + " " * (pointer_pad - 1)) if j == 0 else (" " * pointer_pad)
+                line = f"{prefix}{wline}".ljust(inner)[:inner]
                 out.append("║" + line + "║\n", style=color)
         out.append(bot + "\n", style=f"bold {color}")
         return out
@@ -648,10 +1726,24 @@ class RightPanel(Static):
             self._render_skeleton()
             return
 
+        # Track per-section changes so we can vary the pointer when config changes.
+        if not hasattr(self, "_prev_sections"):
+            self._prev_sections = {"costs": [], "breaks": [], "refs": [], "losers": []}
+
         t = Text()
-        t.append(self._boxed("COSTS", verdict.tradeoffs[:3], icon="⚠", color="#FFB000"))
+
+        costs = verdict.tradeoffs[:3]
+        prev_costs: list[str] = self._prev_sections.get("costs", [])
+        costs_changed = {i for i, v in enumerate(costs) if i >= len(prev_costs) or prev_costs[i] != v}
+        self._prev_sections["costs"] = list(costs)
+        t.append(self._boxed("COSTS", costs, icon="▣", color="#FFB000", changed_indices=costs_changed))
         t.append("\n")
-        t.append(self._boxed("BREAKS", verdict.break_conditions[:3], icon="⛔", color="#FF1F7E"))
+
+        breaks = verdict.break_conditions[:3]
+        prev_breaks: list[str] = self._prev_sections.get("breaks", [])
+        breaks_changed = {i for i, v in enumerate(breaks) if i >= len(prev_breaks) or prev_breaks[i] != v}
+        self._prev_sections["breaks"] = list(breaks)
+        t.append(self._boxed("BREAKS", breaks, icon="▣", color="#FF1F7E", changed_indices=breaks_changed))
 
         # External references that back the general security/architecture statements.
         # Keep them compact so they remain readable in the narrow right panel.
@@ -664,17 +1756,31 @@ class RightPanel(Static):
             "NIST 800-63B — Digital Identity (nist.gov/800-63b)",
             "Firebase Auth docs (firebase.google.com/docs/auth)",
         ]
-        t.append(self._boxed("REFERENCES", refs, icon="ℹ", color="#00D9FF"))
+        prev_refs: list[str] = self._prev_sections.get("refs", [])
+        refs_changed = {i for i, v in enumerate(refs) if i >= len(prev_refs) or prev_refs[i] != v}
+        self._prev_sections["refs"] = list(refs)
+        t.append(self._boxed("REFERENCES", refs, icon="▣", color="#00D9FF", changed_indices=refs_changed))
 
-        t.append("\nLOSERS\n", style="bold red")
+        losers: list[str] = []
         for method, _score in verdict.ranked:
             if method == verdict.recommended:
                 continue
             bullets = verdict.rejections.get(method, [])[:1]
             reason = bullets[0] if bullets else "Lower fit"
-            t.append(f"{_method_short(method.value)}: ", style="bold red")
-            t.append(reason, style="red")
-            t.append("\n")
+            losers.append(f"{_method_short(method.value)}: {reason}")
+
+        if not losers:
+            losers = ["No rejected options"]
+
+        losers = losers[:3]
+        prev_losers: list[str] = self._prev_sections.get("losers", [])
+        losers_changed = {i for i, v in enumerate(losers) if i >= len(prev_losers) or prev_losers[i] != v}
+        self._prev_sections["losers"] = list(losers)
+
+        t.append("\n")
+        # Use a pleasant purple so LOSERS isn't visually identical to BREAKS.
+        # Use a pixel-style bullet for LOSERS points (no emoji icons).
+        t.append(self._boxed("LOSERS", losers, icon="■", color="#BD93F9", changed_indices=losers_changed))
 
         self.update(t)
 
@@ -685,13 +1791,13 @@ class RightPanel(Static):
             return _bar_shimmer(pct, width, phase)
 
         t = Text()
-        t.append(self._boxed("COSTS", ["loading…", ph(18, 72.0), ph(18, 58.0)], icon="⚠", color="#FFB000"))
+        t.append(self._boxed("COSTS", ["loading…", ph(18, 72.0), ph(18, 58.0)], icon="▣", color="#FFB000"))
         t.append("\n")
-        t.append(self._boxed("BREAKS", ["loading…", ph(18, 66.0), ph(18, 52.0)], icon="⛔", color="#FF1F7E"))
+        t.append(self._boxed("BREAKS", ["loading…", ph(18, 66.0), ph(18, 52.0)], icon="▣", color="#FF1F7E"))
         t.append("\n")
-        t.append(self._boxed("REFERENCES", ["loading…", ph(18, 62.0)], icon="ℹ", color="#00D9FF"))
-        t.append("\nLOSERS\n", style="bold red")
-        t.append("loading…\n", style="dim")
+        t.append(self._boxed("REFERENCES", ["loading…", ph(18, 62.0)], icon="▣", color="#00D9FF"))
+        t.append("\n")
+        t.append(self._boxed("LOSERS", ["loading…", ph(18, 54.0)], icon="■", color="#BD93F9"))
         self.update(t)
 
 
@@ -774,10 +1880,6 @@ class CommandBar(Static):
 
     status: reactive[str] = reactive("ready")
 
-    _typing_target: str = ""
-    _typing_i: int = 0
-    _typing_timer = None
-
     def compose(self) -> ComposeResult:
         yield Label("λ", id="prompt")
         yield Input(placeholder="commands: r(reset)  q(quit)  ?(help)", id="cmd")
@@ -785,43 +1887,15 @@ class CommandBar(Static):
 
     def on_mount(self) -> None:
         self.query_one("#cmd", Input).focus()
-        self._render_status()
-
-    def _render_status(self) -> None:
-        # Render with a simple typing cursor while animating.
-        shown = self.status
-        if self._typing_target and self._typing_i < len(self._typing_target):
-            shown = self._typing_target[: self._typing_i] + "▌"
-        self.query_one("#status", Label).update(Text(shown, style="dim"))
+        self.set_status(self.status)
 
     def set_status(self, s: str) -> None:
-        self._typing_target = s
-        self._typing_i = 0
-
-        # Restart typing timer.
-        if self._typing_timer is not None:
-            try:
-                self._typing_timer.stop()
-            except Exception:
-                pass
-
-        def tick() -> None:
-            if self._typing_i >= len(self._typing_target):
-                self.status = self._typing_target
-                if self._typing_timer is not None:
-                    try:
-                        self._typing_timer.stop()
-                    except Exception:
-                        pass
-                self._render_status()
-                return
-            self._typing_i += 1
-            self._render_status()
-
-        # Fast enough to feel snappy.
-        self._typing_timer = self.set_interval(0.02, tick)
-        self._render_status()
-        self._render_status()
+        self.status = s
+        # Delegate typing to the shared app typewriter for consistency.
+        try:
+            getattr(self.app, "type_status")(s)
+        except Exception:
+            self.query_one("#status", Label).update(Text(s, style="dim"))
 
 
 class AuthRefereeTextual(App):
@@ -835,6 +1909,9 @@ class AuthRefereeTextual(App):
     _intro_done: bool = False
     _live_pulse: int = 0
     _pulse_phase: int = 0
+
+    _typewriter: _Typewriter | None = None
+    _type_timer = None
 
     # Phase-2: busy/loading controller (show spinner only if work > 200ms).
     _busy_depth: int = 0
@@ -852,6 +1929,7 @@ class AuthRefereeTextual(App):
     _last_rows: list[ComparisonRow] | None = None
     _snapshot: dict[str, object] = {}
     _flash_until: dict[str, float] = {}
+    _trace_open: set[str] = set()  # Track which trace method nodes are expanded
 
     _anim_active: bool = False
     _anim_start: float = 0.0
@@ -889,8 +1967,7 @@ class AuthRefereeTextual(App):
                 yield VerdictPanel(id="verdict")
                 yield Static("TRACE", classes="section")
                 yield Static("", id="trace_up")
-                with VerticalScroll(id="trace_scroll"):
-                    yield TracePanel(id="trace")
+                yield TraceViewport(id="trace_scroll")
                 yield Static("", id="trace_down")
             with Vertical(id="right_wrap"):
                 yield Static("", id="right_up")
@@ -908,6 +1985,10 @@ class AuthRefereeTextual(App):
         self.set_interval(0.20, self._tick_scroll_indicators)
         self.set_interval(0.12, self._tick_pulse)
 
+        # Shared typewriter (typing + blinking cursor).
+        self._typewriter = _Typewriter(self)
+        self._type_timer = self.set_interval(0.03, self._tick_typewriter)
+
         # Apply initial theme/view.
         self._apply_theme()
         self._apply_view_mode()
@@ -915,6 +1996,88 @@ class AuthRefereeTextual(App):
         # Run staged intro.
         await self._run_intro()
         self._recompute()
+
+    async def _tween(self, widget, attribute: str, value, *, duration: float, easing: str = "in_out_cubic") -> None:
+        """Animate a widget attribute safely.
+
+        Textual 7.0.1's animation plumbing is currently unstable in this project
+        (BoundAnimator call mismatch). For stability, do a small manual tween for
+        the few attributes we use (opacity/offset) and fall back to applying the
+        final value directly.
+        """
+        try:
+            dur = max(0.0, float(duration))
+            steps = 10 if dur >= 0.12 else 6
+            sleep_s = dur / max(1, steps)
+
+            # Read current value as start.
+            start_val = getattr(widget.styles, attribute)
+
+            def lerp(a: float, b: float, t: float) -> float:
+                return a + (b - a) * t
+
+            def ease(t: float) -> float:
+                # Keep easing deterministic regardless of string.
+                return _ease_in_out(t)
+
+            # Only tween attributes we actually use.
+            if attribute == "opacity":
+                a = float(start_val if start_val is not None else 1.0)
+                b = float(value)
+                for i in range(1, steps + 1):
+                    t = ease(i / steps)
+                    widget.styles.opacity = lerp(a, b, t)
+                    await asyncio.sleep(sleep_s)
+                widget.styles.opacity = b
+                return
+
+            if attribute == "offset":
+                sa = start_val if isinstance(start_val, tuple) else (0, 0)
+                sb = value if isinstance(value, tuple) else (0, 0)
+                ax, ay = int(sa[0]), int(sa[1])
+                bx, by = int(sb[0]), int(sb[1])
+                for i in range(1, steps + 1):
+                    t = ease(i / steps)
+                    widget.styles.offset = (int(round(lerp(ax, bx, t))), int(round(lerp(ay, by, t))))
+                    await asyncio.sleep(sleep_s)
+                widget.styles.offset = (bx, by)
+                return
+
+            # Unknown attribute: just apply.
+            setattr(widget.styles, attribute, value)
+        except Exception:
+            # Never let eye-candy crash the app.
+            try:
+                setattr(widget.styles, attribute, value)
+            except Exception:
+                pass
+
+    def _tick_typewriter(self) -> None:
+        if self._typewriter is None:
+            return
+        self._typewriter.tick()
+
+    def type_status(self, s: str) -> None:
+        if self._typewriter is None:
+            return
+        # #status is inside CommandBar but id-unique in the app.
+        self._typewriter.start("status", s, selector="#status", style="dim", speed_s=0.02, blink=True)
+
+    def _type_busy_label(self, s: str) -> None:
+        if self._typewriter is None:
+            return
+        # Busy label is rendered as part of the spinner line; no direct selector.
+        self._typewriter.start("busy", s, selector=None, style="bold #FFB000", speed_s=0.02, blink=True)
+
+    async def _type_boot(self, s: str) -> None:
+        if self._typewriter is None:
+            return
+        self._typewriter.start("boot", s, selector="#boot", style="bold #00D9FF", speed_s=0.04, blink=True)
+        # Wait until typing is complete.
+        for _ in range(400):
+            if self._typewriter.is_done("boot"):
+                break
+            await asyncio.sleep(0.01)
 
     def _tick_live(self) -> None:
         if not self.live_mode:
@@ -936,7 +2099,7 @@ class AuthRefereeTextual(App):
     def _tick_pulse(self) -> None:
         self._pulse_phase = (self._pulse_phase + 1) % 8
         # Pulse the focused panel border by toggling classes.
-        for pid in ("#left", "#center", "#right_wrap", "#compare"):
+        for pid in ("#left", "#center", "#right_wrap", "#compare", "#bar"):
             try:
                 self.query_one(pid).remove_class("pulse_a")
                 self.query_one(pid).remove_class("pulse_b")
@@ -977,6 +2140,7 @@ class AuthRefereeTextual(App):
         """
         self._busy_depth += 1
         self._busy_label = label
+        self._type_busy_label(label)
 
         if self._busy_visible:
             return
@@ -1047,7 +2211,10 @@ class AuthRefereeTextual(App):
 
         frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         ch = frames[self._pulse_phase % len(frames)]
-        w.update(Text(f"{ch} {self._busy_label}", style="bold #FFB000"))
+        label = self._busy_label
+        if self._typewriter is not None:
+            label = self._typewriter.get_display("busy") or label
+        w.update(Text(f"{ch} {label}", style="bold #FFB000"))
         w.add_class("show")
 
     async def _run_intro(self) -> None:
@@ -1068,12 +2235,7 @@ class AuthRefereeTextual(App):
 
         # Boot logo typing.
         boot.add_class("show")
-        msg = "OAUTH"
-        cur = ""
-        for ch in msg:
-            cur += ch
-            boot.update(Text(cur, style="bold #00D9FF"))
-            await asyncio.sleep(0.04)
+        await self._type_boot("OAUTH")
         await asyncio.sleep(0.12)
         boot.remove_class("show")
         boot.update("")
@@ -1081,11 +2243,11 @@ class AuthRefereeTextual(App):
         # Header slides down.
         top.styles.offset = (0, -2)
         top.styles.opacity = 0
-        await top.animate("opacity", 1.0, duration=0.20, easing="in_out_cubic")
-        await top.animate("offset", (0, 0), duration=0.22, easing="in_out_cubic")
+        await self._tween(top, "opacity", 1.0, duration=0.20, easing="in_out_cubic")
+        await self._tween(top, "offset", (0, 0), duration=0.22, easing="in_out_cubic")
 
         # Scanline
-        await scan.animate("opacity", 1.0, duration=0.18, easing="in_out_cubic")
+        await self._tween(scan, "opacity", 1.0, duration=0.18, easing="in_out_cubic")
 
         # Panels
         left = self.query_one("#left")
@@ -1099,17 +2261,17 @@ class AuthRefereeTextual(App):
         center.styles.opacity = 0
         right.styles.opacity = 0
 
-        await left.animate("opacity", 1.0, duration=0.22, easing="in_out_cubic")
-        await left.animate("offset", (0, 0), duration=0.25, easing="in_out_cubic")
-        await center.animate("opacity", 1.0, duration=0.22, easing="in_out_cubic")
-        await center.animate("offset", (0, 0), duration=0.25, easing="in_out_cubic")
-        await right.animate("opacity", 1.0, duration=0.22, easing="in_out_cubic")
-        await right.animate("offset", (0, 0), duration=0.25, easing="in_out_cubic")
+        await self._tween(left, "opacity", 1.0, duration=0.22, easing="in_out_cubic")
+        await self._tween(left, "offset", (0, 0), duration=0.25, easing="in_out_cubic")
+        await self._tween(center, "opacity", 1.0, duration=0.22, easing="in_out_cubic")
+        await self._tween(center, "offset", (0, 0), duration=0.25, easing="in_out_cubic")
+        await self._tween(right, "opacity", 1.0, duration=0.22, easing="in_out_cubic")
+        await self._tween(right, "offset", (0, 0), duration=0.25, easing="in_out_cubic")
 
         # Comparison fades in.
-        await compare_title.animate("opacity", 1.0, duration=0.18, easing="in_out_cubic")
-        await compare.animate("opacity", 1.0, duration=0.18, easing="in_out_cubic")
-        await bar.animate("opacity", 1.0, duration=0.18, easing="in_out_cubic")
+        await self._tween(compare_title, "opacity", 1.0, duration=0.18, easing="in_out_cubic")
+        await self._tween(compare, "opacity", 1.0, duration=0.18, easing="in_out_cubic")
+        await self._tween(bar, "opacity", 1.0, duration=0.18, easing="in_out_cubic")
 
         self._intro_done = True
 
@@ -1145,9 +2307,9 @@ class AuthRefereeTextual(App):
             self._render(self._last_ctx)
 
     def _tick_scroll_indicators(self) -> None:
-        def update_pair(scroll_id: str, top_id: str, bot_id: str) -> None:
+        def update_pair(scroll_id: str, top_id: str, bot_id: str, compact: bool = False) -> None:
             try:
-                s = self.query_one(scroll_id, VerticalScroll)
+                s = self.query_one(scroll_id)
                 top = self.query_one(top_id, Static)
                 bot = self.query_one(bot_id, Static)
             except Exception:
@@ -1158,28 +2320,53 @@ class AuthRefereeTextual(App):
             above = max(0, y)
             below = max(0, max_y - y)
 
-            top.update(Text(f"▲▲▲ {above} above ▲▲▲" if above else "", style="dim #00D9FF"))
-            bot.update(Text(f"▼▼▼ {below} below ▼▼▼" if below else "", style="dim #00D9FF"))
+            if compact:
+                # Compact indicators for left panel
+                top.update(Text(f"▲ {above}" if above else "", style="dim #00D9FF"))
+                bot.update(Text(f"▼ {below}" if below else "", style="dim #00D9FF"))
+            else:
+                top.update(Text(f"▲▲▲ {above} above ▲▲▲" if above else "", style="dim #00D9FF"))
+                bot.update(Text(f"▼▼▼ {below} below ▼▼▼" if below else "", style="dim #00D9FF"))
 
         update_pair("#trace_scroll", "#trace_up", "#trace_down")
         update_pair("#right_scroll", "#right_up", "#right_down")
+        update_pair("#left_scroll", "#left_scroll_up", "#left_scroll_down", compact=True)
 
     def _ctx_from_controls(self) -> UserContext:
-        app = self.query_one("#app", Select).value
-        users = self.query_one("#users", Select).value
-        sec = self.query_one("#sec", Select).value
-        backend = self.query_one("#backend", Select).value
-        team = self.query_one("#team", Select).value
-        social = self.query_one("#social", Select).value
+        # NOTE: Textual Select may transiently report value=None/invalid during
+        # misclicks / focus changes. Never crash the app for that; instead,
+        # fall back to last known-good context (or defaults).
+        last = self._last_ctx
 
-        # Map values back to enums using their .value strings.
+        def safe_enum(enum_cls, raw, fallback):
+            try:
+                if raw is None:
+                    raise ValueError("empty")
+                return enum_cls(raw)
+            except Exception:
+                return fallback
+
+        app_raw = self.query_one("#app", Select).value
+        users_raw = self.query_one("#users", Select).value
+        sec_raw = self.query_one("#sec", Select).value
+        backend_raw = self.query_one("#backend", Select).value
+        team_raw = self.query_one("#team", Select).value
+        social_raw = self.query_one("#social", Select).value
+
+        app = safe_enum(ApplicationType, app_raw, last.application_type if last else ApplicationType.WEB)
+        users = safe_enum(ExpectedUsers, users_raw, last.expected_users if last else ExpectedUsers.BTW_1K_50K)
+        sec = safe_enum(SecuritySensitivity, sec_raw, last.security_sensitivity if last else SecuritySensitivity.MEDIUM)
+        backend = safe_enum(BackendArchitecture, backend_raw, last.backend_architecture if last else BackendArchitecture.STATELESS)
+        team = safe_enum(TeamExperience, team_raw, last.team_experience if last else TeamExperience.INTERMEDIATE)
+        social = safe_enum(SocialLoginRequired, social_raw, last.social_login_required if last else SocialLoginRequired.NO)
+
         return UserContext(
-            application_type=ApplicationType(app),
-            expected_users=ExpectedUsers(users),
-            security_sensitivity=SecuritySensitivity(sec),
-            backend_architecture=BackendArchitecture(backend),
-            team_experience=TeamExperience(team),
-            social_login_required=SocialLoginRequired(social),
+            application_type=app,
+            expected_users=users,
+            security_sensitivity=sec,
+            backend_architecture=backend,
+            team_experience=team,
+            social_login_required=social,
         )
 
     def _recompute(self) -> None:
@@ -1247,7 +2434,7 @@ class AuthRefereeTextual(App):
 
         # Panels pull animation/flash state from app.
         self.query_one("#verdict", VerdictPanel).update_from(ctx, verdict=verdict)
-        self.query_one("#trace", TracePanel).update_from(ctx, scoring=scoring, verdict=verdict)
+        self.query_one("#trace_scroll", TraceViewport).update_from(ctx, scoring=scoring, verdict=verdict)
         self.query_one("#right", RightPanel).update_from(ctx, verdict=verdict)
         self.query_one("#compare", ComparisonTable).update_from(ctx, scoring=scoring, verdict=verdict, rows=rows)
 
@@ -1255,7 +2442,19 @@ class AuthRefereeTextual(App):
     def _on_select_changed(self, _event: Select.Changed) -> None:
         self._busy_begin("recomputing…")
         try:
-            self._recompute()
+            try:
+                self._recompute()
+            except Exception as e:
+                # Prevent Textual's full-screen exception UI on transient input.
+                try:
+                    self.query_one("#bar", CommandBar).set_status(f"input glitch ignored: {type(e).__name__}")
+                except Exception:
+                    pass
+                if self._last_ctx is not None:
+                    try:
+                        self._render(self._last_ctx)
+                    except Exception:
+                        pass
         finally:
             self._busy_end()
 
@@ -1469,21 +2668,36 @@ class AuthRefereeTextual(App):
     def action_view_compact(self) -> None:
         self.view_mode = "compact"
         self._apply_view_mode()
-        self.query_one("#bar", CommandBar).set_status("view: compact")
+        # Collapse all traces in compact mode
+        self._trace_open = set()
+        self._recompute()
+        self.query_one("#bar", CommandBar).set_status("view: compact (winner only)")
 
     def action_view_detailed(self) -> None:
         self.view_mode = "detailed"
         self._apply_view_mode()
-        self.query_one("#bar", CommandBar).set_status("view: detailed")
+        # Expand all traces in detailed mode
+        if self._last_verdict:
+            self._trace_open = {m.value for m, _ in self._last_verdict.ranked}
+        self._recompute()
+        self.query_one("#bar", CommandBar).set_status("view: detailed (all expanded)")
 
     def action_view_focus(self) -> None:
         self.view_mode = "focus"
         self._apply_view_mode()
-        self.query_one("#bar", CommandBar).set_status("view: focus")
+        # Focus mode: expand winner trace only
+        if self._last_verdict:
+            self._trace_open = {self._last_verdict.recommended.value}
+        self._recompute()
+        self.query_one("#bar", CommandBar).set_status("view: focus (trace only)")
 
     def action_view_default(self) -> None:
         self.view_mode = "default"
         self._apply_view_mode()
+        # Reset to winner-expanded
+        if self._last_verdict:
+            self._trace_open = {self._last_verdict.recommended.value}
+        self._recompute()
         self.query_one("#bar", CommandBar).set_status("view: default")
 
     def _apply_view_mode(self) -> None:
